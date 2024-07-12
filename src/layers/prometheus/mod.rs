@@ -6,25 +6,64 @@ use std::{
 
 use apalis_core::{error::Error, request::Request, storage::Job};
 use futures::Future;
+use metrics::{Counter, Histogram};
 use pin_project_lite::pin_project;
 use tower::{Layer, Service};
 
 /// A layer to support prometheus metrics
 #[derive(Debug, Default)]
-pub struct PrometheusLayer;
+pub struct PrometheusLayer {
+    // storing this here at creation time, but we could potentially get
+    // the job type and name by capturing the job type in a phantom data field
+    // and grabbing the typename or NAME from it
+    job_name: String,
+}
+
+impl PrometheusLayer {
+    /// Create a new PrometheusLayer that instruments metrics with a lable of the specified job
+    /// name
+    pub fn new(job_name: &str) -> Self {
+        Self {
+            job_name: job_name.to_string(),
+        }
+    }
+}
 
 impl<S> Layer<S> for PrometheusLayer {
     type Service = PrometheusService<S>;
 
     fn layer(&self, service: S) -> Self::Service {
-        PrometheusService { service }
+        let labels = [("job_name", self.job_name.clone())];
+
+        let req_counter = metrics::counter!("apalis_requests_total", &labels);
+        let req_histogram = metrics::histogram!("apalis_request_duration_seconds", &labels);
+
+        PrometheusService {
+            service,
+            req_counter,
+            req_histogram,
+        }
     }
 }
 
 /// This service implements the metric collection behavior
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PrometheusService<S> {
     service: S,
+    req_counter: Counter,
+    req_histogram: Histogram,
+}
+
+// manually implement debug because the metric structs do not have a Debug implementation
+impl<S> std::fmt::Debug for PrometheusService<S>
+where
+    S: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrometheusService")
+            .field("service", &self.service)
+            .finish()
+    }
 }
 
 impl<S, J, F, Res> Service<Request<J>> for PrometheusService<S>
@@ -44,13 +83,11 @@ where
     fn call(&mut self, request: Request<J>) -> Self::Future {
         let start = Instant::now();
         let req = self.service.call(request);
-        let job_type = std::any::type_name::<J>().to_string();
-        let op = J::NAME;
         ResponseFuture {
             inner: req,
             start,
-            job_type,
-            operation: op.to_string(),
+            req_counter: self.req_counter.clone(),
+            req_histogram: self.req_histogram.clone(),
         }
     }
 }
@@ -61,8 +98,8 @@ pin_project! {
         #[pin]
         pub(crate) inner: F,
         pub(crate) start: Instant,
-        pub(crate) job_type: String,
-        pub(crate) operation: String
+        pub(crate) req_counter: Counter,
+        pub(crate) req_histogram: Histogram,
     }
 }
 
@@ -74,24 +111,13 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
-
         let response = futures::ready!(this.inner.poll(cx));
 
         let latency = this.start.elapsed().as_secs_f64();
-        let status = response
-            .as_ref()
-            .ok()
-            .map(|_res| "Ok".to_string())
-            .unwrap_or_else(|| "Err".to_string());
 
-        let labels = [
-            ("name", this.operation.to_string()),
-            ("namespace", this.job_type.to_string()),
-            ("status", status),
-            ("latency", latency.to_string()),
-        ];
-        metrics::counter!("requests_total", &labels);
-        metrics::histogram!("request_duration_seconds", &labels);
+        this.req_counter.increment(1);
+        this.req_histogram.record(latency);
+
         Poll::Ready(response)
     }
 }
