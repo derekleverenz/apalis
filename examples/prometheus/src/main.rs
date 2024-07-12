@@ -31,6 +31,24 @@ async fn main() -> Result<()> {
         .init();
     let conn = apalis::redis::connect("redis://127.0.0.1/").await?;
     let storage = RedisStorage::new(conn);
+
+    // create the monitor with one worker
+    // we need to build the worker before installing the prometheus recorder, since the metrics
+    // need to be registered before the recorder is installed to be tracked and the PrometheusLayer
+    // registers the metrics when the service is built internally.
+    let monitor = async {
+        Monitor::<TokioExecutor>::new()
+            .register_with_count(2, {
+                WorkerBuilder::new("tasty-banana")
+                    .layer(PrometheusLayer::new("tasty-banana"))
+                    .with_storage(storage.clone())
+                    .build_fn(send_email)
+            })
+            .run()
+            .await
+    };
+
+    // setup and install the prometheus recorder and
     // build our application with some routes
     let recorder_handle = setup_metrics_recorder();
     let app = Router::new()
@@ -46,17 +64,7 @@ async fn main() -> Result<()> {
             .await
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))
     };
-    let monitor = async {
-        Monitor::<TokioExecutor>::new()
-            .register_with_count(2, {
-                WorkerBuilder::new("tasty-banana")
-                    .layer(PrometheusLayer)
-                    .with_storage(storage.clone())
-                    .build_fn(send_email)
-            })
-            .run()
-            .await
-    };
+
     let _res = futures::future::try_join(monitor, http)
         .await
         .expect("Could not start services");
